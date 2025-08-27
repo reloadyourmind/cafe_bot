@@ -25,14 +25,18 @@ class MenuItem
     #[Assert\Positive]
     private int $priceCents;
 
+    #[ORM\Column(type: 'string', length: 1024, nullable: true)]
+    private ?string $photoUrl = null;
+
     #[ORM\Column(type: 'boolean')]
     private bool $active = true;
 
-    public function __construct(string $name, int $priceCents, ?string $description = null)
+    public function __construct(string $name, int $priceCents, ?string $description = null, ?string $photoUrl = null)
     {
         $this->name = $name;
         $this->priceCents = $priceCents;
         $this->description = $description;
+        $this->photoUrl = $photoUrl;
         $this->active = true;
     }
 
@@ -69,6 +73,16 @@ class MenuItem
     public function setPriceCents(int $priceCents): void
     {
         $this->priceCents = $priceCents;
+    }
+
+    public function getPhotoUrl(): ?string
+    {
+        return $this->photoUrl;
+    }
+
+    public function setPhotoUrl(?string $photoUrl): void
+    {
+        $this->photoUrl = $photoUrl;
     }
 
     public function isActive(): bool
