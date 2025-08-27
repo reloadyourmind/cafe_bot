@@ -22,6 +22,7 @@ class TelegramWebhookController extends AbstractController
         private readonly TelegramClient $telegramClient,
         #[Autowire(param: 'env(TELEGRAM_ADMIN_IDS)')] private readonly string $adminIds,
         #[Autowire(param: 'env(TELEGRAM_WEBHOOK_SECRET)')] private readonly string $webhookSecret,
+        #[Autowire(param: 'env(PLACEHOLDER_IMAGE_URL)')] private readonly string $placeholderImageUrl,
     ) {}
 
     #[Route('/telegram/webhook/{secret}', name: 'telegram_webhook', methods: ['POST'])]
@@ -54,6 +55,31 @@ class TelegramWebhookController extends AbstractController
         // Handle inline keyboard callbacks
         if ($callback) {
             $data = (string)($callback['data'] ?? '');
+            if (preg_match('/^addqty:(-?\d+):(\d+)$/', $data, $m)) {
+                $qty = max(1, (int)$m[1]);
+                $itemId = (int)$m[2];
+                $item = $this->entityManager->getRepository(MenuItem::class)->find($itemId);
+                if ($item) {
+                    $order = new Order($chatId);
+                    $orderItem = new OrderItem($item, $qty);
+                    $order->addItem($orderItem);
+                    $this->entityManager->persist($order);
+                    $this->entityManager->flush();
+                    $this->telegramClient->answerCallbackQuery((string)$callback['id'], '🛒 Added x'.$qty);
+                    $this->telegramClient->sendMessage($chatId, sprintf("🛒 <b>%s</b> × %d. Order #%d total $%s. /confirm %d", htmlspecialchars($item->getName()), $qty, $order->getId(), number_format($order->getTotalCents()/100, 2), $order->getId()));
+                } else {
+                    $this->telegramClient->answerCallbackQuery((string)$callback['id'], 'Item not found', true);
+                }
+                return new JsonResponse(['ok' => true]);
+            }
+            if (preg_match('/^qty:([+-]1):(\d+)$/', $data, $m)) {
+                $delta = $m[1] === '+1' ? 1 : -1;
+                $itemId = (int)$m[2];
+                $textResp = $delta > 0 ? '➕' : '➖';
+                $this->telegramClient->answerCallbackQuery((string)$callback['id'], $textResp);
+                $this->telegramClient->sendMessage($chatId, "Tip: Tap Add 🛒 to add to cart");
+                return new JsonResponse(['ok' => true]);
+            }
             if (str_starts_with($data, 'add:')) {
                 $id = (int)substr($data, 4);
                 $item = $this->entityManager->getRepository(MenuItem::class)->find($id);
@@ -78,16 +104,18 @@ class TelegramWebhookController extends AbstractController
                 $this->telegramClient->sendMessage($chatId, "📭 Menu is empty. Please check back later.");
                 return new JsonResponse(['ok' => true]);
             }
-            $chunks = array_chunk($items, 10);
-            foreach ($chunks as $pageIndex => $pageItems) {
-                $keyboard = [ 'inline_keyboard' => [] ];
-                foreach ($pageItems as $item) {
-                    $keyboard['inline_keyboard'][] = [[
-                        'text' => sprintf("%s — $%s", $item->getName(), number_format($item->getPriceCents()/100, 2)),
-                        'callback_data' => 'add:' . $item->getId(),
-                    ]];
-                }
-                $this->telegramClient->sendMessage($chatId, $pageIndex === 0 ? "📋 <b>Menu</b>:\nTap to add to cart 🛒" : "—", [
+            foreach ($items as $item) {
+                $caption = sprintf("<b>%s</b>\n$%s\n%s", htmlspecialchars($item->getName()), number_format($item->getPriceCents()/100, 2), htmlspecialchars($item->getDescription() ?? ''));
+                $keyboard = [
+                    'inline_keyboard' => [[
+                        ['text' => '➖', 'callback_data' => 'qty:-1:' . $item->getId()],
+                        ['text' => 'Add 🛒', 'callback_data' => 'addqty:1:' . $item->getId()],
+                        ['text' => '➕', 'callback_data' => 'qty:+1:' . $item->getId()],
+                    ]],
+                ];
+                $photo = $item->getPhotoUrl() ?: $this->placeholderImageUrl;
+                $this->telegramClient->sendPhoto($chatId, $photo, [
+                    'caption' => $caption,
                     'reply_markup' => json_encode($keyboard),
                 ]);
             }
