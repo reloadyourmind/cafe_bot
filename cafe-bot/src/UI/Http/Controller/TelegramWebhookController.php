@@ -5,7 +5,7 @@ namespace App\UI\Http\Controller;
 use App\Entity\MenuItem;
 use App\Entity\Order;
 use App\Entity\OrderItem;
-use App\Entity\AdminSession;
+use Symfony\Contracts\Cache\CacheInterface;
 use App\Infrastructure\Telegram\TelegramClient;
 use Doctrine\ORM\EntityManagerInterface;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
@@ -23,6 +23,7 @@ class TelegramWebhookController extends AbstractController
         #[Autowire(param: 'env(TELEGRAM_ADMIN_IDS)')] private readonly string $adminIds,
         #[Autowire(param: 'env(TELEGRAM_WEBHOOK_SECRET)')] private readonly string $webhookSecret,
         #[Autowire(param: 'env(PLACEHOLDER_IMAGE_URL)')] private readonly string $placeholderImageUrl,
+        private readonly CacheInterface $cache,
     ) {}
 
     #[Route('/telegram/webhook/{secret}', name: 'telegram_webhook', methods: ['POST'])]
@@ -43,7 +44,7 @@ class TelegramWebhookController extends AbstractController
         $text = trim((string)($message['text'] ?? ''));
 
         if ($text === '/start') {
-            $this->telegramClient->sendMessage($chatId, "☕️ Welcome to Cafe Bot!\nUse /menu to browse 🍽️ and /order to place 📦");
+            $this->telegramClient->sendMessage($chatId, "☕️ Welcome!\n/menu — browse 🍽️\n/order — quick order 📦");
             return new JsonResponse(['ok' => true]);
         }
 
@@ -127,16 +128,9 @@ class TelegramWebhookController extends AbstractController
                 $this->telegramClient->sendMessage($chatId, "⛔ You are not allowed to do this.");
                 return new JsonResponse(['ok' => true]);
             }
-            // Start wizard
-            $session = $this->entityManager->getRepository(AdminSession::class)->findOneBy(['telegramUserId' => $chatId]);
-            if ($session) {
-                $this->entityManager->remove($session);
-                $this->entityManager->flush();
-            }
-            $session = new AdminSession($chatId, AdminSession::FLOW_ADD, 'name');
-            $this->entityManager->persist($session);
-            $this->entityManager->flush();
-            $this->telegramClient->sendMessage($chatId, "🧩 Let's add a product!\nStep 1/4 — Send name ✍️");
+            // Start wizard (cache-based)
+            $this->setWizardState($chatId, ['step' => 'name', 'data' => []]);
+            $this->telegramClient->sendMessage($chatId, "🧩 Add product — Step 1/4\nSend name ✍️");
             return new JsonResponse(['ok' => true]);
         }
 
@@ -218,41 +212,34 @@ class TelegramWebhookController extends AbstractController
             return new JsonResponse(['ok' => true]);
         }
 
-        $this->telegramClient->sendMessage($chatId, "🤖 Commands:\n/start — welcome\n/menu — list items\n/order Name | qty — place\n/confirm ID — confirm order\n\n<b>Admin</b>:\n/additem Name | price | desc\n/orders\n/complete ID");
+        $this->telegramClient->sendMessage($chatId, "🤖 /menu • /order • /confirm <id>\n<b>Admin</b>: /additem • /orders • /complete <id>");
         return new JsonResponse(['ok' => true]);
     }
 
     private function handleAdminWizard(int $chatId, string $text): bool
     {
-        $repo = $this->entityManager->getRepository(AdminSession::class);
-        $session = $repo->findOneBy(['telegramUserId' => $chatId]);
-        if (!$session) { return false; }
-
-        $data = $session->getData();
-        switch ($session->getStep()) {
+        $state = $this->getWizardState($chatId);
+        if (!$state) { return false; }
+        $step = $state['step'] ?? 'name';
+        $data = $state['data'] ?? [];
+        switch ($step) {
             case 'name':
                 if ($text === '') { $this->telegramClient->sendMessage($chatId, "⚠️ Please send a non-empty name."); return true; }
                 $data['name'] = $text;
-                $session->setData($data);
-                $session->setStep('price');
-                $this->entityManager->flush();
-                $this->telegramClient->sendMessage($chatId, "Step 2/4 — Send price, e.g. 3.50 💵");
+                $this->setWizardState($chatId, ['step' => 'price', 'data' => $data]);
+                $this->telegramClient->sendMessage($chatId, "Step 2/4\nSend price, e.g. 3.50 💵");
                 return true;
             case 'price':
                 $price = (float)str_replace(',', '.', $text);
                 if ($price <= 0) { $this->telegramClient->sendMessage($chatId, "⚠️ Send a positive price, e.g. 2.00"); return true; }
                 $data['priceCents'] = (int)round($price * 100);
-                $session->setData($data);
-                $session->setStep('description');
-                $this->entityManager->flush();
-                $this->telegramClient->sendMessage($chatId, "Step 3/4 — Send description (or '-' to skip) 📝");
+                $this->setWizardState($chatId, ['step' => 'description', 'data' => $data]);
+                $this->telegramClient->sendMessage($chatId, "Step 3/4\nSend description (or '-' to skip) 📝");
                 return true;
             case 'description':
                 $data['description'] = $text === '-' ? null : $text;
-                $session->setData($data);
-                $session->setStep('photo');
-                $this->entityManager->flush();
-                $this->telegramClient->sendMessage($chatId, "Step 4/4 — Send photo URL (or '-' to skip) 🖼️");
+                $this->setWizardState($chatId, ['step' => 'photo', 'data' => $data]);
+                $this->telegramClient->sendMessage($chatId, "Step 4/4\nSend photo URL (or '-' to skip) 🖼️");
                 return true;
             case 'photo':
                 $data['photoUrl'] = $text === '-' ? null : $text;
@@ -262,9 +249,9 @@ class TelegramWebhookController extends AbstractController
                 $photo = $data['photoUrl'] ?? null;
                 $item = new MenuItem($name, $priceCents, $desc, $photo);
                 $this->entityManager->persist($item);
-                $this->entityManager->remove($session);
                 $this->entityManager->flush();
-                $this->telegramClient->sendMessage($chatId, sprintf("✅ Added <b>%s</b> $%s", htmlspecialchars($name), number_format($priceCents/100, 2)));
+                $this->clearWizardState($chatId);
+                $this->telegramClient->sendMessage($chatId, sprintf("✅ Added <b>%s</b> — $%s", htmlspecialchars($name), number_format($priceCents/100, 2)));
                 return true;
         }
         return false;
@@ -275,6 +262,33 @@ class TelegramWebhookController extends AbstractController
         $uid = (int)($message['from']['id'] ?? 0);
         $ids = array_filter(array_map('trim', explode(',', $this->adminIds)));
         return in_array((string)$uid, $ids, true);
+    }
+
+    private function wizardCacheKey(int $chatId): string
+    {
+        return 'admin_wizard_'.$chatId;
+    }
+
+    private function getWizardState(int $chatId): ?array
+    {
+        $key = $this->wizardCacheKey($chatId);
+        return $this->cache->get($key, function () { return null; });
+    }
+
+    private function setWizardState(int $chatId, array $state): void
+    {
+        $key = $this->wizardCacheKey($chatId);
+        // use low-level pool to set TTL
+        if (method_exists($this->cache, 'delete')) {
+            // Nothing
+        }
+        $this->cache->delete($key);
+        $this->cache->get($key, function () use ($state) { return $state; });
+    }
+
+    private function clearWizardState(int $chatId): void
+    {
+        $this->cache->delete($this->wizardCacheKey($chatId));
     }
 }
 
