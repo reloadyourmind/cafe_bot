@@ -1,0 +1,10 @@
+controllers:
+    resource:
+        path: ../src/Controller/
+        namespace: App\Controller
+    type: attribute
+
+telegram_webhook:
+    path: /telegram/webhook/{secret}
+    controller: App\UI\Http\Controller\TelegramWebhookController
+    methods: [POST]
