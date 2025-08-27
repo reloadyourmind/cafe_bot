@@ -28,5 +28,29 @@ class TelegramClient
             'body' => $payload,
         ]);
     }
+
+    public function sendPhoto(int $chatId, string $photoUrl, array $options = []): void
+    {
+        $payload = array_merge([
+            'chat_id' => $chatId,
+            'photo' => $photoUrl,
+            'parse_mode' => 'HTML',
+        ], $options);
+        $this->httpClient->request('POST', sprintf('https://api.telegram.org/bot%s/sendPhoto', $this->botToken), [
+            'body' => $payload,
+        ]);
+    }
+
+    public function answerCallbackQuery(string $callbackQueryId, string $text = '', bool $showAlert = false): void
+    {
+        $payload = [
+            'callback_query_id' => $callbackQueryId,
+            'text' => $text,
+            'show_alert' => $showAlert,
+        ];
+        $this->httpClient->request('POST', sprintf('https://api.telegram.org/bot%s/answerCallbackQuery', $this->botToken), [
+            'body' => $payload,
+        ]);
+    }
 }
 

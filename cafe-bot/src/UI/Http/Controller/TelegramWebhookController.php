@@ -5,6 +5,7 @@ namespace App\UI\Http\Controller;
 use App\Entity\MenuItem;
 use App\Entity\Order;
 use App\Entity\OrderItem;
+use App\Entity\AdminSession;
 use App\Infrastructure\Telegram\TelegramClient;
 use Doctrine\ORM\EntityManagerInterface;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
@@ -31,12 +32,13 @@ class TelegramWebhookController extends AbstractController
         }
 
         $update = json_decode($request->getContent(), true) ?? [];
-        $message = $update['message'] ?? $update['edited_message'] ?? null;
+        $callback = $update['callback_query'] ?? null;
+        $message = $update['message'] ?? $update['edited_message'] ?? ($callback['message'] ?? null);
         if (!$message) {
             return new JsonResponse(['ok' => true]);
         }
 
-        $chatId = (int)($message['chat']['id'] ?? 0);
+        $chatId = (int)($message['chat']['id'] ?? ($callback['from']['id'] ?? 0));
         $text = trim((string)($message['text'] ?? ''));
 
         if ($text === '/start') {
@@ -44,17 +46,50 @@ class TelegramWebhookController extends AbstractController
             return new JsonResponse(['ok' => true]);
         }
 
+        // Handle admin wizard steps before commands
+        if ($this->handleAdminWizard($chatId, $text)) {
+            return new JsonResponse(['ok' => true]);
+        }
+
+        // Handle inline keyboard callbacks
+        if ($callback) {
+            $data = (string)($callback['data'] ?? '');
+            if (str_starts_with($data, 'add:')) {
+                $id = (int)substr($data, 4);
+                $item = $this->entityManager->getRepository(MenuItem::class)->find($id);
+                if ($item) {
+                    $order = new Order($chatId);
+                    $orderItem = new OrderItem($item, 1);
+                    $order->addItem($orderItem);
+                    $this->entityManager->persist($order);
+                    $this->entityManager->flush();
+                    $this->telegramClient->answerCallbackQuery((string)$callback['id'], '🛒 Added to cart!');
+                    $this->telegramClient->sendMessage($chatId, sprintf("🛒 <b>%s</b> added. Order #%d total $%s. Use /confirm %d", htmlspecialchars($item->getName()), $order->getId(), number_format($order->getTotalCents()/100, 2), $order->getId()));
+                } else {
+                    $this->telegramClient->answerCallbackQuery((string)$callback['id'], 'Item not found', true);
+                }
+                return new JsonResponse(['ok' => true]);
+            }
+        }
+
         if ($text === '/menu') {
             $items = $this->entityManager->getRepository(MenuItem::class)->findBy(['active' => true]);
             if (!$items) {
                 $this->telegramClient->sendMessage($chatId, "📭 Menu is empty. Please check back later.");
-            } else {
-                $lines = ["📋 <b>Menu</b>:"]; 
-                foreach ($items as $item) {
-                    $price = number_format($item->getPriceCents() / 100, 2);
-                    $lines[] = sprintf("• %s — <b>$%s</b>", htmlspecialchars($item->getName()), $price);
+                return new JsonResponse(['ok' => true]);
+            }
+            $chunks = array_chunk($items, 10);
+            foreach ($chunks as $pageIndex => $pageItems) {
+                $keyboard = [ 'inline_keyboard' => [] ];
+                foreach ($pageItems as $item) {
+                    $keyboard['inline_keyboard'][] = [[
+                        'text' => sprintf("%s — $%s", $item->getName(), number_format($item->getPriceCents()/100, 2)),
+                        'callback_data' => 'add:' . $item->getId(),
+                    ]];
                 }
-                $this->telegramClient->sendMessage($chatId, implode("\n", $lines));
+                $this->telegramClient->sendMessage($chatId, $pageIndex === 0 ? "📋 <b>Menu</b>:\nTap to add to cart 🛒" : "—", [
+                    'reply_markup' => json_encode($keyboard),
+                ]);
             }
             return new JsonResponse(['ok' => true]);
         }
@@ -64,24 +99,16 @@ class TelegramWebhookController extends AbstractController
                 $this->telegramClient->sendMessage($chatId, "⛔ You are not allowed to do this.");
                 return new JsonResponse(['ok' => true]);
             }
-            // Format: /additem Name | 3.50 | description
-            $payload = trim(substr($text, strlen('/additem')));
-            if ($payload === '') {
-                $this->telegramClient->sendMessage($chatId, "🛠️ Usage: /additem Name | 3.50 | optional description");
-                return new JsonResponse(['ok' => true]);
+            // Start wizard
+            $session = $this->entityManager->getRepository(AdminSession::class)->findOneBy(['telegramUserId' => $chatId]);
+            if ($session) {
+                $this->entityManager->remove($session);
+                $this->entityManager->flush();
             }
-            $parts = array_map('trim', explode('|', $payload));
-            $name = $parts[0] ?? '';
-            $priceCents = isset($parts[1]) ? (int)round(((float)$parts[1]) * 100) : 0;
-            $desc = $parts[2] ?? null;
-            if ($name === '' || $priceCents <= 0) {
-                $this->telegramClient->sendMessage($chatId, "⚠️ Please provide name and positive price. Example: /additem Espresso | 2.50 | Strong coffee");
-                return new JsonResponse(['ok' => true]);
-            }
-            $item = new MenuItem($name, $priceCents, $desc);
-            $this->entityManager->persist($item);
+            $session = new AdminSession($chatId, AdminSession::FLOW_ADD, 'name');
+            $this->entityManager->persist($session);
             $this->entityManager->flush();
-            $this->telegramClient->sendMessage($chatId, "✅ Added: <b>" . htmlspecialchars($name) . "</b> at $" . number_format($priceCents/100, 2));
+            $this->telegramClient->sendMessage($chatId, "🧩 Let's add a product!\nStep 1/4 — Send name ✍️");
             return new JsonResponse(['ok' => true]);
         }
 
@@ -165,6 +192,54 @@ class TelegramWebhookController extends AbstractController
 
         $this->telegramClient->sendMessage($chatId, "🤖 Commands:\n/start — welcome\n/menu — list items\n/order Name | qty — place\n/confirm ID — confirm order\n\n<b>Admin</b>:\n/additem Name | price | desc\n/orders\n/complete ID");
         return new JsonResponse(['ok' => true]);
+    }
+
+    private function handleAdminWizard(int $chatId, string $text): bool
+    {
+        $repo = $this->entityManager->getRepository(AdminSession::class);
+        $session = $repo->findOneBy(['telegramUserId' => $chatId]);
+        if (!$session) { return false; }
+
+        $data = $session->getData();
+        switch ($session->getStep()) {
+            case 'name':
+                if ($text === '') { $this->telegramClient->sendMessage($chatId, "⚠️ Please send a non-empty name."); return true; }
+                $data['name'] = $text;
+                $session->setData($data);
+                $session->setStep('price');
+                $this->entityManager->flush();
+                $this->telegramClient->sendMessage($chatId, "Step 2/4 — Send price, e.g. 3.50 💵");
+                return true;
+            case 'price':
+                $price = (float)str_replace(',', '.', $text);
+                if ($price <= 0) { $this->telegramClient->sendMessage($chatId, "⚠️ Send a positive price, e.g. 2.00"); return true; }
+                $data['priceCents'] = (int)round($price * 100);
+                $session->setData($data);
+                $session->setStep('description');
+                $this->entityManager->flush();
+                $this->telegramClient->sendMessage($chatId, "Step 3/4 — Send description (or '-' to skip) 📝");
+                return true;
+            case 'description':
+                $data['description'] = $text === '-' ? null : $text;
+                $session->setData($data);
+                $session->setStep('photo');
+                $this->entityManager->flush();
+                $this->telegramClient->sendMessage($chatId, "Step 4/4 — Send photo URL (or '-' to skip) 🖼️");
+                return true;
+            case 'photo':
+                $data['photoUrl'] = $text === '-' ? null : $text;
+                $name = $data['name'];
+                $priceCents = (int)$data['priceCents'];
+                $desc = $data['description'] ?? null;
+                $photo = $data['photoUrl'] ?? null;
+                $item = new MenuItem($name, $priceCents, $desc, $photo);
+                $this->entityManager->persist($item);
+                $this->entityManager->remove($session);
+                $this->entityManager->flush();
+                $this->telegramClient->sendMessage($chatId, sprintf("✅ Added <b>%s</b> $%s", htmlspecialchars($name), number_format($priceCents/100, 2)));
+                return true;
+        }
+        return false;
     }
 
     private function isAdmin(array $message): bool
