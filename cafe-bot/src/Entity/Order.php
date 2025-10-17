@@ -22,6 +22,15 @@ class Order
     #[ORM\Column(type: 'bigint')]
     private int $telegramUserId;
 
+    #[ORM\Column(type: 'string', length: 255)]
+    private string $ordererName;
+
+    #[ORM\Column(type: 'string', length: 255, nullable: true)]
+    private ?string $ordererNickname = null;
+
+    #[ORM\Column(type: 'string', length: 20, nullable: true)]
+    private ?string $ordererPhone = null;
+
     #[ORM\Column(type: 'string', length: 32)]
     private string $status = self::STATUS_NEW;
 
@@ -34,9 +43,12 @@ class Order
     #[ORM\Column(type: 'datetime_immutable')]
     private \DateTimeImmutable $createdAt;
 
-    public function __construct(int $telegramUserId)
+    public function __construct(int $telegramUserId, string $ordererName, ?string $ordererNickname = null, ?string $ordererPhone = null)
     {
         $this->telegramUserId = $telegramUserId;
+        $this->ordererName = $ordererName;
+        $this->ordererNickname = $ordererNickname;
+        $this->ordererPhone = $ordererPhone;
         $this->items = new ArrayCollection();
         $this->createdAt = new \DateTimeImmutable();
         $this->status = self::STATUS_NEW;
@@ -50,6 +62,36 @@ class Order
     public function getTelegramUserId(): int
     {
         return $this->telegramUserId;
+    }
+
+    public function getOrdererName(): string
+    {
+        return $this->ordererName;
+    }
+
+    public function setOrdererName(string $ordererName): void
+    {
+        $this->ordererName = $ordererName;
+    }
+
+    public function getOrdererNickname(): ?string
+    {
+        return $this->ordererNickname;
+    }
+
+    public function setOrdererNickname(?string $ordererNickname): void
+    {
+        $this->ordererNickname = $ordererNickname;
+    }
+
+    public function getOrdererPhone(): ?string
+    {
+        return $this->ordererPhone;
+    }
+
+    public function setOrdererPhone(?string $ordererPhone): void
+    {
+        $this->ordererPhone = $ordererPhone;
     }
 
     public function getStatus(): string
