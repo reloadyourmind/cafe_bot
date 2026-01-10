@@ -1,0 +1,1023 @@
+<?php
+
+namespace App\UI\Http\Controller;
+
+use App\Entity\Admin;
+use App\Entity\MenuItem;
+use App\Entity\Order;
+use App\Entity\OrderItem;
+//use Symfony\Contracts\Cache\CacheInterface;
+use App\Infrastructure\Telegram\TelegramClient;
+use Doctrine\ORM\EntityManagerInterface;
+use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
+use Symfony\Component\DependencyInjection\Attribute\Autowire;
+use Symfony\Component\HttpFoundation\JsonResponse;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\Routing\Attribute\Route;
+use Symfony\Contracts\Cache\ItemInterface;
+use Psr\Cache\CacheItemPoolInterface;
+
+
+class TelegramWebhookController extends AbstractController
+{
+    private bool $debug = true; // Включите для отладки
+    
+    public function __construct(
+        private readonly EntityManagerInterface $entityManager,
+        private readonly TelegramClient $telegramClient,
+        #[Autowire(param: 'env(TELEGRAM_WEBHOOK_SECRET)')] 
+        private readonly string $webhookSecret,
+        #[Autowire(param: 'env(PLACEHOLDER_IMAGE_URL)')] 
+        private readonly string $placeholderImageUrl,
+        #[Autowire(param: 'env(TELEGRAM_USE_WEBHOOK)')] 
+        private readonly bool $useWebhook,
+        //private readonly CacheInterface $cache,
+        private readonly CacheItemPoolInterface $cache
+    ) {}
+
+    #[Route('/telegram/webhook/{secret}', name: 'telegram_webhook', methods: ['POST'])]
+    public function webhook(Request $request, string $secret): Response
+    {
+        if ($this->useWebhook && $secret !== $this->webhookSecret) {
+            return new Response('Запрещено', 403);
+        }
+
+        $update = json_decode($request->getContent(), true) ?? [];
+        $callback = $update['callback_query'] ?? null;
+        $message = $update['message'] ?? $update['edited_message'] ?? ($callback['message'] ?? null);
+        
+        if (!$message) {
+            return new JsonResponse(['ok' => true]);
+        }
+
+        $chatId = (int)($message['chat']['id'] ?? ($callback['from']['id'] ?? 0));
+        $userId = (int)($message['from']['id'] ?? ($callback['from']['id'] ?? 0));
+        $text = trim((string)($message['text'] ?? ''));
+
+        if ($this->debug) {
+            error_log("DEBUG: User {$userId}, Chat {$chatId}, Text: '{$text}'");
+            error_log("DEBUG: Message data: " . json_encode($message));
+        }
+
+        // Проверяем, находимся ли мы в процессе добавления товара
+        $addProductState = $this->getProductState($userId);
+        
+        if ($this->debug) {
+            error_log("DEBUG: Product state for user {$userId}: " . json_encode($addProductState));
+        }
+$state = $this->getProductState($userId);
+
+if ($state !== null) {
+    $this->handleAddProductFlow($chatId, $userId, $text, $state, $message);
+    return new JsonResponse(['ok' => true]);
+}
+
+        // Обработка callback запросов
+        if ($callback) {
+            $this->handleCallbackQuery($callback, $chatId, $userId);
+            return new JsonResponse(['ok' => true]);
+        }
+
+        // Обработка текстовых команд
+        $this->handleTextCommand($text, $chatId, $userId, $message);
+        return new JsonResponse(['ok' => true]);
+    }
+
+private function getProductState(int $userId): ?array
+{
+    $key = "telegram_product_state_{$userId}";
+
+    try {
+        $item = $this->cache->getItem($key);
+
+        if (!$item->isHit()) {
+            return null;
+        }
+
+        $state = $item->get();
+        return is_array($state) ? $state : null;
+    } catch (\Throwable $e) {
+        error_log('getProductState error: ' . $e->getMessage());
+        return null;
+    }
+}
+
+private function saveProductState(int $userId, ?array $state): void
+{
+    $key = "telegram_product_state_{$userId}";
+
+    try {
+        if ($state === null) {
+            $this->cache->deleteItem($key);
+            return;
+        }
+
+        $item = $this->cache->getItem($key);
+        $item->set($state);
+        $item->expiresAfter(1800); // 30 минут
+        $this->cache->save($item);
+    } catch (\Throwable $e) {
+        error_log('saveProductState error: ' . $e->getMessage());
+    }
+}
+
+private function handleTextCommand(string $text, int $chatId, int $userId, array $message): void
+{
+    // FSM сюда больше не попадает
+    switch ($text) {
+        case '/start':
+        case '/menu':
+            $this->showMainMenu($chatId, $userId);
+            break;
+
+        case '/addproduct':
+            if ($this->isAdmin($userId)) {
+                $this->startAddProduct($chatId, $userId);
+            }
+            break;
+
+        case '/cancel':
+        case 'Отмена':
+            $this->saveProductState($userId, null);
+            $this->showAdminProducts($chatId, $userId);
+            break;
+
+        default:
+            $this->showMainMenu($chatId, $userId);
+    }
+}
+
+    private function handleAddProductFlow(int $chatId, int $userId, string $text, array $state, array $message): void
+    {
+        if ($this->debug) {
+            error_log("DEBUG: handleAddProductFlow called for user {$userId}");
+            error_log("DEBUG: Current state: " . json_encode($state));
+            error_log("DEBUG: Text: '{$text}'");
+        }
+        
+        // Проверяем команды отмены
+        if ($text === '/cancel' || $text === 'Отмена') {
+            $this->saveProductState($userId, null);
+            $this->showAdminProducts($chatId, $userId);
+            return;
+        }
+        
+        $step = $state['step'] ?? 1;
+        $editingField = $state['editing_field'] ?? null;
+        
+        if ($this->debug) {
+            error_log("DEBUG: Step: {$step}, Editing field: " . ($editingField ?? 'none'));
+        }
+        
+        if ($editingField) {
+            $this->handleEditField($chatId, $userId, $text, $state, $editingField, $message);
+            return;
+        }
+        
+        switch ($step) {
+            case 1:
+                $state['name'] = $text;
+                $state['step'] = 2;
+                $this->saveProductState($userId, $state);
+                if ($this->debug) {
+                    error_log("DEBUG: Saved state for step 2: " . json_encode($state));
+                }
+                $this->sendStepMessage($chatId, 2, "Введите описание товара:", 'admin_product_skip_desc');
+                break;
+                
+            case 2:
+                $state['description'] = $text === '-' ? null : $text;
+                $state['step'] = 3;
+                $this->saveProductState($userId, $state);
+                if ($this->debug) {
+                    error_log("DEBUG: Saved state for step 3: " . json_encode($state));
+                }
+                $this->sendStepMessage($chatId, 3, "Введите цену товара в центах:\n(Например: для $10.50 введите 1050)");
+                break;
+                
+            case 3:
+                if (!is_numeric($text) || $text <= 0) {
+                    $this->telegramClient->sendMessage($chatId, "❌ Цена должна быть положительным числом. Попробуйте снова:");
+                    return;
+                }
+                $state['price_cents'] = (int)$text;
+                $state['step'] = 4;
+                $this->saveProductState($userId, $state);
+                if ($this->debug) {
+                    error_log("DEBUG: Saved state for step 4: " . json_encode($state));
+                }
+                $this->sendStepMessage($chatId, 4, "Отправьте URL фотографии товара:", 'admin_product_skip_photo', true);
+                break;
+                
+            case 4:
+                $this->processPhotoStep($chatId, $userId, $text, $state, $message);
+                break;
+        }
+    }
+
+    private function startAddProduct(int $chatId, int $userId): void
+    {
+        if (!$this->isAdmin($userId)) {
+            $this->telegramClient->sendMessage($chatId, "❌ Доступ запрещен!");
+            return;
+        }
+        
+        if ($this->debug) {
+            error_log("DEBUG: Starting add product for user {$userId}");
+        }
+	$state = [
+		        'step' => 1,
+			        'name' => null,
+				        'description' => null,
+					        'price' => null,
+						        'photo_file_id' => null,
+							    ];
+
+	    $this->saveProductState($userId, $state);
+        
+        if ($this->debug) {
+            error_log("DEBUG: Initial state saved for user {$userId}");
+            // Проверим, сохранилось ли
+            $testState = $this->getProductState($userId);
+            error_log("DEBUG: Verified state after save: " . json_encode($testState));
+        }
+        
+        $this->telegramClient->sendMessage($chatId, "➕ <b>Добавление нового товара</b>\n\n📝 Шаг 1/5\nВведите название товара:", [
+            'reply_markup' => json_encode([
+                'inline_keyboard' => [[['text' => '❌ Отмена', 'callback_data' => 'admin_products']]]
+            ]),
+            'parse_mode' => 'HTML'
+        ]);
+    }
+
+    // Остальные методы остаются без изменений, как в предыдущей версии
+    private function handleCallbackQuery(array $callback, int $chatId, int $userId): void
+    {
+        $data = (string)($callback['data'] ?? '');
+        $callbackId = (string)($callback['id'] ?? '');
+
+        try {
+            if (str_starts_with($data, 'menu_')) {
+                $this->handleMenuCallback($data, $chatId, $userId, $callbackId);
+            } elseif (str_starts_with($data, 'product_')) {
+                $this->handleProductCallback($data, $chatId, $userId, $callbackId);
+            } elseif (str_starts_with($data, 'order_')) {
+                $this->handleOrderCallback($data, $chatId, $userId, $callbackId);
+            } elseif (str_starts_with($data, 'admin_')) {
+                $this->handleAdminCallback($data, $chatId, $userId, $callbackId);
+            } else {
+                $this->telegramClient->answerCallbackQuery($callbackId);
+            }
+        } catch (\Exception $e) {
+            error_log('Callback query error: ' . $e->getMessage());
+        }
+    }
+
+    private function handleMenuCallback(string $data, int $chatId, int $userId, string $callbackId): void
+    {
+        if ($data === 'menu_main') {
+            $this->showMainMenu($chatId, $userId);
+        } elseif ($data === 'menu_customer') {
+            $this->showCustomerMenu($chatId, $userId);
+        } elseif ($data === 'menu_admin') {
+            if ($this->isAdmin($userId)) {
+                $this->showAdminMenu($chatId, $userId);
+            } else {
+                $this->telegramClient->answerCallbackQuery($callbackId, 'Доступ запрещен', true);
+            }
+        }
+        
+        $this->telegramClient->answerCallbackQuery($callbackId);
+    }
+
+    private function handleProductCallback(string $data, int $chatId, int $userId, string $callbackId): void
+    {
+        if (preg_match('/^product_(\d+)_(\d+)$/', $data, $matches)) {
+            $productId = (int)$matches[1];
+            $quantity = (int)$matches[2];
+            
+            $product = $this->entityManager->getRepository(MenuItem::class)->find($productId);
+            if (!$product || !$product->isActive()) {
+                $this->telegramClient->answerCallbackQuery($callbackId, 'Товар недоступен', true);
+                return;
+            }
+
+            $order = $this->getCurrentOrder($userId);
+            if (!$order) {
+                $order = new Order($userId, 'Покупатель', null, null);
+                $this->entityManager->persist($order);
+            }
+
+            $existingItem = null;
+            foreach ($order->getItems() as $item) {
+                if ($item->getMenuItem()->getId() === $productId) {
+                    $existingItem = $item;
+                    break;
+                }
+            }
+
+            if ($existingItem) {
+                $existingItem->setQuantity($existingItem->getQuantity() + $quantity);
+            } else {
+                $orderItem = new OrderItem($product, $quantity);
+                $order->addItem($orderItem);
+            }
+
+            $this->entityManager->flush();
+
+            $this->telegramClient->answerCallbackQuery($callbackId, "Добавлено {$product->getName()} x{$quantity}");
+            $this->showCustomerMenu($chatId, $userId);
+        }
+    }
+
+    private function handleOrderCallback(string $data, int $chatId, int $userId, string $callbackId): void
+    {
+        if ($data === 'order_view') {
+            $this->showCurrentOrder($chatId, $userId);
+        } elseif ($data === 'order_confirm') {
+            $this->confirmOrder($chatId, $userId);
+        } elseif ($data === 'order_cancel') {
+            $this->cancelOrder($chatId, $userId);
+        }
+        
+        $this->telegramClient->answerCallbackQuery($callbackId);
+    }
+
+    private function handleAdminCallback(string $data, int $chatId, int $userId, string $callbackId): void
+    {
+        if (!$this->isAdmin($userId)) {
+            $this->telegramClient->answerCallbackQuery($callbackId, 'Доступ запрещен', true);
+            return;
+        }
+
+        $adminHandlers = [
+            'admin_products' => fn() => $this->showAdminProducts($chatId, $userId),
+            'admin_orders' => fn() => $this->showAdminOrders($chatId, $userId),
+            'admin_product_add' => fn() => $this->startAddProduct($chatId, $userId),
+            'admin_product_finalize_active' => fn() => $this->finalizeProduct($chatId, $userId, true),
+            'admin_product_finalize_inactive' => fn() => $this->finalizeProduct($chatId, $userId, false),
+            'admin_product_skip_photo' => fn() => $this->skipPhotoStep($chatId, $userId),
+            'admin_product_edit_name' => fn() => $this->editProductField($chatId, $userId, 'name', 'новое название'),
+            'admin_product_edit_desc' => fn() => $this->editProductField($chatId, $userId, 'description', 'новое описание'),
+            'admin_product_edit_price' => fn() => $this->editProductField($chatId, $userId, 'price', 'новую цену в центах'),
+            'admin_product_edit_photo' => fn() => $this->editProductField($chatId, $userId, 'photo', 'новый URL фото или отправьте фото'),
+        ];
+
+        foreach ($adminHandlers as $prefix => $handler) {
+            if ($data === $prefix) {
+                $handler();
+                $this->telegramClient->answerCallbackQuery($callbackId);
+                return;
+            }
+        }
+
+        if (str_starts_with($data, 'admin_product_manage_')) {
+            $productId = (int)substr($data, 21);
+            $this->showProductManagement($chatId, $productId, $userId);
+        } elseif (str_starts_with($data, 'admin_product_toggle_')) {
+            $productId = (int)substr($data, 21);
+            $this->toggleProductStatus($chatId, $productId, $userId);
+        } elseif (str_starts_with($data, 'admin_product_delete_')) {
+            $productId = (int)substr($data, 21);
+            $this->showDeleteConfirmation($chatId, $productId, $userId);
+        } elseif (str_starts_with($data, 'admin_product_delete_confirm_')) {
+            $productId = (int)substr($data, 29);
+            $this->deleteProduct($chatId, $productId, $userId);
+        } elseif (str_starts_with($data, 'admin_product_delete_cancel_')) {
+            $productId = (int)substr($data, 28);
+            $this->showProductManagement($chatId, $productId, $userId);
+        } elseif (str_starts_with($data, 'admin_order_status_')) {
+            $orderId = (int)substr($data, 19);
+            $this->showOrderStatusOptions($chatId, $orderId, $userId);
+        } elseif (str_starts_with($data, 'admin_set_status_')) {
+            $parts = explode('_', $data);
+            $orderId = (int)$parts[3];
+            $status = $parts[4];
+            $this->updateOrderStatus($chatId, $orderId, $status, $userId);
+        }
+        
+        $this->telegramClient->answerCallbackQuery($callbackId);
+    }
+   private function handleEditField(int $chatId, int $userId, string $text, array $state, string $field, array $message): void
+    {
+        switch ($field) {
+            case 'name':
+                $state['name'] = $text;
+                break;
+            case 'description':
+                $state['description'] = $text === '-' ? null : $text;
+                break;
+            case 'price':
+                if (!is_numeric($text) || $text <= 0) {
+                    $this->telegramClient->sendMessage($chatId, "❌ Цена должна быть положительным числом. Попробуйте снова:");
+                    return;
+                }
+                $state['price_cents'] = (int)$text;
+                break;
+            case 'photo':
+                $this->processPhotoInput($chatId, $userId, $text, $state, $message);
+                return;
+        }
+        
+        unset($state['editing_field']);
+        $state['step'] = 5;
+        $this->saveProductState($userId, $state);
+        $this->showProductPreview($chatId, $state, $userId);
+    }
+
+    private function processPhotoStep(int $chatId, int $userId, string $text, array $state, array $message): void
+    {
+        if (isset($message['photo']) && !empty($message['photo'])) {
+            $state['photo_file_id'] = $message['photo'][count($message['photo']) - 1]['file_id'];
+            $state['photo_type'] = 'file_id';
+        } else {
+            if ($text !== '-' && $text !== '' && !filter_var($text, FILTER_VALIDATE_URL)) {
+                $this->telegramClient->sendMessage($chatId, "❌ Это не похоже на валидный URL. Введите корректный URL:");
+                return;
+            }
+            $state['photo_url'] = ($text === '-' || $text === '') ? null : $text;
+            $state['photo_type'] = 'url';
+        }
+        
+        $state['step'] = 5;
+        $this->saveProductState($userId, $state);
+        $this->showProductPreview($chatId, $state, $userId);
+    }
+
+    private function processPhotoInput(int $chatId, int $userId, string $text, array &$state, array $message): void
+    {
+        if (isset($message['photo']) && !empty($message['photo'])) {
+            $state['photo_file_id'] = $message['photo'][count($message['photo']) - 1]['file_id'];
+            $state['photo_type'] = 'file_id';
+            $state['photo_url'] = null;
+        } else {
+            if ($text !== '-' && $text !== '' && !filter_var($text, FILTER_VALIDATE_URL)) {
+                $this->telegramClient->sendMessage($chatId, "❌ Это не похоже на валидный URL. Введите корректный URL:");
+                return;
+            }
+            $state['photo_url'] = ($text === '-' || $text === '') ? null : $text;
+            $state['photo_type'] = 'url';
+            $state['photo_file_id'] = null;
+        }
+        
+        unset($state['editing_field']);
+        $state['step'] = 5;
+        $this->saveProductState($userId, $state);
+        $this->showProductPreview($chatId, $state, $userId);
+    }
+
+    private function sendStepMessage(int $chatId, int $step, string $message, string $skipCallback = null, bool $allowPhoto = false): void
+    {
+        $keyboard = ['inline_keyboard' => []];
+        
+        if ($skipCallback) {
+            $keyboard['inline_keyboard'][] = [['text' => '➡️ Пропустить', 'callback_data' => $skipCallback]];
+        }
+        
+        if ($allowPhoto) {
+            $message .= "\n\nМожно отправить фото файлом";
+        }
+        
+        $keyboard['inline_keyboard'][] = [['text' => '❌ Отмена', 'callback_data' => 'admin_products']];
+        
+        $this->telegramClient->sendMessage($chatId, "📝 Шаг {$step}/5\n{$message}", [
+            'reply_markup' => json_encode($keyboard)
+        ]);
+    }
+
+private function skipPhotoStep(int $chatId, int $userId): void
+{
+    $state = $this->getProductState($userId);
+
+    if (!$state) {
+        return;
+    }
+
+    $state['photo_url'] = null;
+    $state['photo_file_id'] = null;
+    $state['step'] = 5;
+
+    $this->saveProductState($userId, $state);
+    $this->showProductPreview($chatId, $state, $userId);
+}
+
+
+    private function editProductField(int $chatId, int $userId, string $field, string $fieldName): void
+    {
+        $state = $this->getProductState($userId);
+        if ($state) {
+            $state['editing_field'] = $field;
+            $this->saveProductState($userId, $state);
+            
+            $message = "✏️ Введите $fieldName товара:";
+            if ($field === 'description') {
+                $message .= "\n(или отправьте '-' чтобы удалить описание)";
+            } elseif ($field === 'photo') {
+                $message .= "\n(или отправьте '-' чтобы удалить фото, или отправьте фото файлом)";
+            }
+            
+            $this->telegramClient->sendMessage($chatId, $message);
+        }
+    }
+
+    private function showProductPreview(int $chatId, array $state, int $userId): void
+    {
+        $preview = $this->formatProductPreview($state);
+        $photo = $state['photo_url'] ?? $state['photo_file_id'] ?? null;
+        
+        $keyboard = [
+            'inline_keyboard' => [
+                [
+                    ['text' => '✅ Активный', 'callback_data' => 'admin_product_finalize_active'],
+                    ['text' => '❌ Неактивный', 'callback_data' => 'admin_product_finalize_inactive']
+                ],
+                [
+                    ['text' => '✏️ Изменить название', 'callback_data' => 'admin_product_edit_name'],
+                    ['text' => '✏️ Изменить описание', 'callback_data' => 'admin_product_edit_desc']
+                ],
+                [
+                    ['text' => '✏️ Изменить цену', 'callback_data' => 'admin_product_edit_price'],
+                    ['text' => empty($photo) ? '🖼️ Добавить фото' : '✏️ Изменить фото', 'callback_data' => 'admin_product_edit_photo']
+                ],
+                [['text' => '❌ Отмена', 'callback_data' => 'admin_products']]
+            ]
+        ];
+
+        $message = "🎯 Шаг 5/5 - Предпросмотр\n\n" . $preview . "\n\nВыберите статус товара:";
+        
+        if ($photo) {
+            $this->telegramClient->sendPhoto($chatId, $photo, [
+                'caption' => $message,
+                'reply_markup' => json_encode($keyboard)
+            ]);
+        } else {
+            $this->telegramClient->sendMessage($chatId, $message, [
+                'reply_markup' => json_encode($keyboard)
+            ]);
+        }
+    }
+
+    private function formatProductPreview(array $data): string
+    {
+        $preview = "📋 <b>Предпросмотр товара</b>\n\n";
+        $preview .= "<b>Название:</b> " . htmlspecialchars($data['name']) . "\n";
+        $preview .= "<b>Описание:</b> " . ($data['description'] ? htmlspecialchars($data['description']) : 'Нет') . "\n";
+        $preview .= "<b>Цена:</b> $" . number_format($data['price_cents'] / 100, 2) . "\n";
+        
+        if (!empty($data['photo_url'])) {
+            $preview .= "<b>Фото:</b> URL\n";
+        } elseif (!empty($data['photo_file_id'])) {
+            $preview .= "<b>Фото:</b> Загружено\n";
+        } else {
+            $preview .= "<b>Фото:</b> Без фото\n";
+        }
+        
+        return $preview;
+    }
+
+    private function finalizeProduct(int $chatId, int $userId, bool $active): void
+    {
+        $state = $this->getProductState($userId);
+        
+        if (!$state) {
+            $this->telegramClient->sendMessage($chatId, "❌ Сессия добавления товара истекла.");
+            return;
+        }
+        
+        $product = new MenuItem(
+            $state['name'],
+            $state['price_cents'],
+            $state['description'] ?? null,
+            $state['photo_url'] ?? null
+        );
+        
+        $product->setActive($active);
+        $this->entityManager->persist($product);
+        $this->entityManager->flush();
+        
+        $this->saveProductState($userId, null);
+        
+        $statusText = $active ? '✅ активный' : '❌ неактивный';
+        $this->telegramClient->sendMessage($chatId, "🎉 <b>Товар успешно добавлен!</b>\n\nID: #{$product->getId()}\nНазвание: {$product->getName()}\nЦена: $" . number_format($product->getPriceCents() / 100, 2) . "\nСтатус: {$statusText}");
+        
+        $this->showAdminProducts($chatId, $userId);
+    }
+
+    private function createMenuKeyboard(int $userId, bool $includeAdmin = true): array
+    {
+        $keyboard = [
+            'inline_keyboard' => [
+                [['text' => '🍽️ Посмотреть меню', 'callback_data' => 'menu_customer']],
+                [['text' => '🛒 Мой заказ', 'callback_data' => 'order_view']],
+            ]
+        ];
+
+        if ($includeAdmin && $this->isAdmin($userId)) {
+            $keyboard['inline_keyboard'][] = [['text' => '⚙️ Панель администратора', 'callback_data' => 'menu_admin']];
+        }
+
+        return $keyboard;
+    }
+
+    private function addBackButton(array &$keyboard, string $backCallback): void
+    {
+        $keyboard['inline_keyboard'][] = [['text' => '🔙 Назад', 'callback_data' => $backCallback]];
+    }
+
+    private function showMainMenu(int $chatId, int $userId): void
+    {
+        $this->telegramClient->sendMessage($chatId, "☕️ Добро пожаловать в наш Кофейный Бот!\n\nВыберите опцию ниже:", [
+            'reply_markup' => json_encode($this->createMenuKeyboard($userId))
+        ]);
+    }
+
+    private function showCustomerMenu(int $chatId, int $userId): void
+    {
+        $products = $this->entityManager->getRepository(MenuItem::class)->findBy(['active' => true]);
+        
+        if (empty($products)) {
+            $keyboard = $this->createMenuKeyboard($userId);
+            $this->addBackButton($keyboard, 'menu_main');
+            $this->telegramClient->sendMessage($chatId, "📭 Меню в настоящее время пусто.", [
+                'reply_markup' => json_encode($keyboard)
+            ]);
+            return;
+        }
+
+        foreach ($products as $product) {
+            $caption = sprintf(
+                "<b>%s</b>\n$%s\n%s",
+                htmlspecialchars($product->getName()),
+                number_format($product->getPriceCents() / 100, 2),
+                htmlspecialchars($product->getDescription() ?? '')
+            );
+
+            $keyboard = [
+                'inline_keyboard' => [
+                    [
+                        ['text' => '➖', 'callback_data' => "product_{$product->getId()}_-1"],
+                        ['text' => 'Добавить в корзину', 'callback_data' => "product_{$product->getId()}_1"],
+                        ['text' => '➕', 'callback_data' => "product_{$product->getId()}_1"],
+                    ]
+                ]
+            ];
+
+            $photo = $product->getPhotoUrl() ?: $this->placeholderImageUrl;
+            $this->telegramClient->sendPhoto($chatId, $photo, [
+                'caption' => $caption,
+                'reply_markup' => json_encode($keyboard)
+            ]);
+        }
+
+        $keyboard = $this->createMenuKeyboard($userId, false);
+        $this->addBackButton($keyboard, 'menu_main');
+        $this->telegramClient->sendMessage($chatId, "Выберите товары для добавления в заказ:", [
+            'reply_markup' => json_encode($keyboard)
+        ]);
+    }
+
+    private function showAdminMenu(int $chatId, int $userId): void
+    {
+        $keyboard = [
+            'inline_keyboard' => [
+                [['text' => '📦 Управление товарами', 'callback_data' => 'admin_products']],
+                [['text' => '📋 Просмотр заказов', 'callback_data' => 'admin_orders']],
+            ]
+        ];
+        $this->addBackButton($keyboard, 'menu_main');
+
+        $this->telegramClient->sendMessage($chatId, "⚙️ Панель администратора\n\nВыберите опцию:", [
+            'reply_markup' => json_encode($keyboard)
+        ]);
+    }
+
+    private function showAdminProducts(int $chatId, int $userId): void
+    {
+        $products = $this->entityManager->getRepository(MenuItem::class)->findBy([], ['id' => 'DESC']);
+        
+        $message = "📦 <b>Управление товарами</b>\n\n";
+        $message .= empty($products) ? "Товары не найдены.\n\n" : '';
+        
+        foreach ($products as $product) {
+            $status = $product->isActive() ? '✅' : '❌';
+            $message .= sprintf(
+                "%s <b>%s</b> (ID: #%d) - $%s\n",
+                $status,
+                htmlspecialchars($product->getName()),
+                $product->getId(),
+                number_format($product->getPriceCents() / 100, 2)
+            );
+        }
+
+        $keyboard = [
+            'inline_keyboard' => [
+                [['text' => '➕ Добавить новый товар', 'callback_data' => 'admin_product_add']],
+            ]
+        ];
+
+        foreach ($products as $product) {
+            $keyboard['inline_keyboard'][] = [[
+                'text' => "✏️ #{$product->getId()} " . substr($product->getName(), 0, 15),
+                'callback_data' => "admin_product_manage_{$product->getId()}"
+            ]];
+        }
+
+        $this->addBackButton($keyboard, 'menu_admin');
+        $this->telegramClient->sendMessage($chatId, $message, [
+            'reply_markup' => json_encode($keyboard)
+        ]);
+    }
+
+    private function showProductManagement(int $chatId, int $productId, int $userId): void
+    {
+        $product = $this->entityManager->getRepository(MenuItem::class)->find($productId);
+        
+        if (!$product) {
+            $this->telegramClient->sendMessage($chatId, "❌ Товар не найден!");
+            $this->showAdminProducts($chatId, $userId);
+            return;
+        }
+
+        $status = $product->isActive() ? '✅ Активный' : '❌ Неактивный';
+        $message = "🛠️ <b>Управление товаром</b>\n\n";
+        $message .= "<b>ID:</b> #{$product->getId()}\n";
+        $message .= "<b>Название:</b> " . htmlspecialchars($product->getName()) . "\n";
+        $message .= "<b>Описание:</b> " . ($product->getDescription() ? htmlspecialchars($product->getDescription()) : 'Нет') . "\n";
+        $message .= "<b>Цена:</b> $" . number_format($product->getPriceCents() / 100, 2) . "\n";
+        $message .= "<b>Фото:</b> " . ($product->getPhotoUrl() ? 'Есть' : 'По умолчанию') . "\n";
+        $message .= "<b>Статус:</b> {$status}\n";
+        
+        if (method_exists($product, 'getCreatedAt') && $product->getCreatedAt()) {
+            $message .= "<b>Создан:</b> " . $product->getCreatedAt()->format('d.m.Y H:i') . "\n";
+        }
+
+        $keyboard = [
+            'inline_keyboard' => [
+                [
+                    ['text' => $product->isActive() ? '❌ Деактивировать' : '✅ Активировать', 
+                     'callback_data' => "admin_product_toggle_{$productId}"]
+                ],
+                [
+                    ['text' => '✏️ Редактировать', 'callback_data' => "admin_product_edit_{$productId}"],
+                    ['text' => '🗑️ Удалить', 'callback_data' => "admin_product_delete_{$productId}"]
+                ],
+            ]
+        ];
+        $this->addBackButton($keyboard, 'admin_products');
+
+        $this->telegramClient->sendMessage($chatId, $message, [
+            'reply_markup' => json_encode($keyboard)
+        ]);
+    }
+
+    private function toggleProductStatus(int $chatId, int $productId, int $userId): void
+    {
+        $product = $this->entityManager->getRepository(MenuItem::class)->find($productId);
+        
+        if (!$product) {
+            $this->telegramClient->sendMessage($chatId, "❌ Товар не найден!");
+            return;
+        }
+
+        $product->setActive(!$product->isActive());
+        $this->entityManager->flush();
+
+        $status = $product->isActive() ? 'активирован' : 'деактивирован';
+        $this->telegramClient->sendMessage($chatId, "✅ Товар #{$productId} {$status}!");
+
+        $this->showProductManagement($chatId, $productId, $userId);
+    }
+
+    private function showDeleteConfirmation(int $chatId, int $productId, int $userId): void
+    {
+        $product = $this->entityManager->getRepository(MenuItem::class)->find($productId);
+        
+        if (!$product) {
+            $this->telegramClient->sendMessage($chatId, "❌ Товар не найден!");
+            return;
+        }
+
+        $message = "⚠️ <b>Подтверждение удаления</b>\n\n";
+        $message .= "Вы уверены, что хотите удалить товар?\n\n";
+        $message .= "<b>" . htmlspecialchars($product->getName()) . "</b>\n";
+        $message .= "ID: #{$productId}\n";
+        $message .= "Цена: $" . number_format($product->getPriceCents() / 100, 2) . "\n\n";
+        $message .= "Это действие нельзя отменить!";
+
+        $keyboard = [
+            'inline_keyboard' => [
+                [
+                    ['text' => '✅ Да, удалить', 'callback_data' => "admin_product_delete_confirm_{$productId}"],
+                    ['text' => '❌ Нет, отменить', 'callback_data' => "admin_product_delete_cancel_{$productId}"]
+                ]
+            ]
+        ];
+
+        $this->telegramClient->sendMessage($chatId, $message, [
+            'reply_markup' => json_encode($keyboard)
+        ]);
+    }
+
+    private function deleteProduct(int $chatId, int $productId, int $userId): void
+    {
+        $product = $this->entityManager->getRepository(MenuItem::class)->find($productId);
+        
+        if (!$product) {
+            $this->telegramClient->sendMessage($chatId, "❌ Товар не найден!");
+            return;
+        }
+
+        $productName = $product->getName();
+        $this->entityManager->remove($product);
+        $this->entityManager->flush();
+
+        $this->telegramClient->sendMessage($chatId, "🗑️ <b>Товар удален</b>\n\nТовар \"{$productName}\" (ID: #{$productId}) был успешно удален.");
+        $this->showAdminProducts($chatId, $userId);
+    }
+
+    private function showCurrentOrder(int $chatId, int $userId): void
+    {
+        $order = $this->getCurrentOrder($userId);
+        
+        if (!$order || $order->getItems()->isEmpty()) {
+            $keyboard = $this->createMenuKeyboard($userId, false);
+            $this->addBackButton($keyboard, 'menu_main');
+            $this->telegramClient->sendMessage($chatId, "🛒 Ваша корзина пуста!\n\nПосмотрите наше меню, чтобы добавить товары.", [
+                'reply_markup' => json_encode($keyboard)
+            ]);
+            return;
+        }
+
+        $message = "🛒 <b>Ваш заказ #{$order->getId()}</b>\n\n";
+        $total = 0;
+
+        foreach ($order->getItems() as $item) {
+            $subtotal = $item->getSubtotalCents();
+            $total += $subtotal;
+            $message .= sprintf(
+                "• %s x%d = $%s\n",
+                htmlspecialchars($item->getMenuItem()->getName()),
+                $item->getQuantity(),
+                number_format($subtotal / 100, 2)
+            );
+        }
+
+        $message .= "\n<b>Итого: $" . number_format($total / 100, 2) . "</b>";
+
+        $keyboard = [
+            'inline_keyboard' => [
+                [
+                    ['text' => '✅ Подтвердить заказ', 'callback_data' => 'order_confirm'],
+                    ['text' => '❌ Отменить заказ', 'callback_data' => 'order_cancel']
+                ],
+                [['text' => '🍽️ Добавить еще товары', 'callback_data' => 'menu_customer']],
+            ]
+        ];
+        $this->addBackButton($keyboard, 'menu_main');
+
+        $this->telegramClient->sendMessage($chatId, $message, [
+            'reply_markup' => json_encode($keyboard)
+        ]);
+    }
+
+    private function confirmOrder(int $chatId, int $userId): void
+    {
+        $order = $this->getCurrentOrder($userId);
+        
+        if (!$order) {
+            $this->telegramClient->sendMessage($chatId, "❌ Активный заказ не найден!");
+            return;
+        }
+
+        $order->setStatus(Order::STATUS_CONFIRMED);
+        $this->entityManager->flush();
+
+        $this->telegramClient->sendMessage($chatId, "✅ Заказ подтвержден! Мы уведомим вас, когда он будет готов. ⏳");
+        $this->notifyAdmins("🆕 Новый заказ #{$order->getId()} подтвержден!\nИтого: $" . number_format($order->getTotalCents() / 100, 2));
+    }
+
+    private function cancelOrder(int $chatId, int $userId): void
+    {
+        $order = $this->getCurrentOrder($userId);
+        
+        if (!$order) {
+            $this->telegramClient->sendMessage($chatId, "❌ Активный заказ не найден!");
+            return;
+        }
+
+        $this->entityManager->remove($order);
+        $this->entityManager->flush();
+
+        $this->telegramClient->sendMessage($chatId, "❌ Заказ отменен.");
+    }
+
+    private function showAdminOrders(int $chatId, int $userId): void
+    {
+        $orders = $this->entityManager->getRepository(Order::class)->findBy([], ['id' => 'DESC'], 10);
+        
+        $message = "📋 <b>Последние заказы</b>\n\n";
+        
+        if (empty($orders)) {
+            $message .= "Заказы не найдены.";
+        } else {
+            foreach ($orders as $order) {
+                $statusEmoji = match($order->getStatus()) {
+                    Order::STATUS_NEW => '🆕',
+                    Order::STATUS_CONFIRMED => '✅',
+                    Order::STATUS_COMPLETED => '🎉',
+                    default => '❓'
+                };
+                
+                $message .= sprintf(
+                    "%s <b>Заказ #%d</b> - %s - $%s\n",
+                    $statusEmoji,
+                    $order->getId(),
+                    strtoupper($order->getStatus()),
+                    number_format($order->getTotalCents() / 100, 2)
+                );
+            }
+        }
+
+        $keyboard = [ 'inline_keyboard' => [] ];
+        $this->addBackButton($keyboard, 'menu_admin');
+
+        $this->telegramClient->sendMessage($chatId, $message, [
+            'reply_markup' => json_encode($keyboard)
+        ]);
+    }
+
+    private function showOrderStatusOptions(int $chatId, int $orderId, int $userId): void
+    {
+        $keyboard = [
+            'inline_keyboard' => [
+                [['text' => '✅ Подтвержден', 'callback_data' => "admin_set_status_{$orderId}_confirmed"]],
+                [['text' => '🎉 Завершен', 'callback_data' => "admin_set_status_{$orderId}_completed"]],
+            ]
+        ];
+        $this->addBackButton($keyboard, 'admin_orders');
+
+        $this->telegramClient->sendMessage($chatId, "Выберите новый статус для заказа #{$orderId}:", [
+            'reply_markup' => json_encode($keyboard)
+        ]);
+    }
+
+    private function updateOrderStatus(int $chatId, int $orderId, string $status, int $userId): void
+    {
+        $order = $this->entityManager->getRepository(Order::class)->find($orderId);
+        
+        if (!$order) {
+            $this->telegramClient->sendMessage($chatId, "❌ Заказ не найден!");
+            return;
+        }
+
+        $oldStatus = $order->getStatus();
+        $order->setStatus($status);
+        $this->entityManager->flush();
+
+        $this->telegramClient->sendMessage($chatId, "✅ Статус заказа #{$orderId} обновлен на " . strtoupper($status));
+        $this->notifyCustomer($order->getTelegramUserId(), $orderId, $oldStatus, $status);
+        $this->showAdminOrders($chatId, $userId);
+    }
+
+    private function notifyCustomer(int $customerId, int $orderId, string $oldStatus, string $newStatus): void
+    {
+        $message = "📢 <b>Обновление заказа</b>\n\n";
+        $message .= "Статус заказа #{$orderId} изменен:\n";
+        $message .= "С: " . strtoupper($oldStatus) . "\n";
+        $message .= "На: " . strtoupper($newStatus) . "\n\n";
+        
+        $statusMessage = match($newStatus) {
+            Order::STATUS_CONFIRMED => "Ваш заказ подтвержден и готовится! 👨‍🍳",
+            Order::STATUS_COMPLETED => "Ваш заказ готов к выдаче! 🎉",
+            default => "Статус вашего заказа обновлен."
+        };
+        
+        $message .= $statusMessage;
+
+        $this->telegramClient->sendMessage($customerId, $message);
+    }
+
+    private function notifyAdmins(string $message): void
+    {
+        $admins = $this->entityManager->getRepository(Admin::class)->findBy(['active' => true]);
+        
+        foreach ($admins as $admin) {
+            $this->telegramClient->sendMessage($admin->getTelegramUserId(), $message);
+        }
+    }
+
+    private function getCurrentOrder(int $userId): ?Order
+    {
+        return $this->entityManager->getRepository(Order::class)
+            ->findOneBy(['telegramUserId' => $userId, 'status' => Order::STATUS_NEW]);
+    }
+
+    private function isAdmin(int $userId): bool
+    {
+        $admin = $this->entityManager->getRepository(Admin::class)
+            ->findOneBy(['telegramUserId' => $userId, 'active' => true]);
+        
+        return $admin !== null;
+    }
+}

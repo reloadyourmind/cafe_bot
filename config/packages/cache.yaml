@@ -1,0 +1,26 @@
+# config/packages/cache.yaml
+framework:
+    cache:
+        # В Symfony 7 вместо prefix_seed можно использовать namespace
+        # app.cache.pool используем для приложения
+        app: cache.adapter.filesystem
+        system: cache.adapter.system
+        
+        pools:
+            # Пул для приложения по умолчанию
+            app.cache:
+                adapter: cache.adapter.filesystem
+                default_lifetime: 3600 # 1 час
+            
+            # Пул для Telegram состояний
+            telegram.cache:
+                adapter: cache.adapter.filesystem
+                default_lifetime: 1800 # 30 минут
+                public: false
+            
+            # Пул для Doctrine
+            doctrine.result_cache_pool:
+                adapter: cache.adapter.filesystem
+            
+            doctrine.system_cache_pool:
+                adapter: cache.adapter.filesystem
